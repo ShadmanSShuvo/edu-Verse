@@ -1,0 +1,1085 @@
+-- ==============================================================================
+-- eduVerse — Unified Database Schema
+-- ==============================================================================
+-- Running this single file on a fresh PostgreSQL database produces the complete,
+-- production-ready schema: all tables, indexes, functions, procedures, triggers,
+-- materialized views, and analytics views are included.
+--
+-- Sources integrated:
+--   • db/schema.psql          (original base schema)
+--   • migrations/*            (all 10 migration files, applied in dependency order)
+--   • db/optimizations_v2.sql (materialized view, composite indexes, automation triggers)
+--   • db/analytics_functions.sql (analytics SQL functions and views)
+-- ==============================================================================
+
+
+-- ==============================================================================
+-- EXTENSIONS
+-- ==============================================================================
+
+-- Enable trigram extension for ILIKE index support on course/user search
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+
+-- ==============================================================================
+-- TABLES
+-- ==============================================================================
+
+-- ── Core Identity ─────────────────────────────────────────────────────────────
+
+CREATE TABLE users (
+    user_id    SERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    email      TEXT UNIQUE NOT NULL,
+    phone_no   TEXT,
+    password   TEXT NOT NULL,
+    salt       TEXT NOT NULL,
+    avatar_url TEXT,                          -- from settings_schema migration
+    bio        TEXT,                          -- from settings_schema migration
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE sessions (
+    token      TEXT PRIMARY KEY,
+    user_id    INT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE roles (
+    role_id SERIAL PRIMARY KEY,
+    name    TEXT UNIQUE NOT NULL
+);
+
+CREATE TABLE permissions (
+    perm_id SERIAL PRIMARY KEY,
+    name    TEXT UNIQUE NOT NULL
+);
+
+CREATE TABLE user_role (
+    user_id INT REFERENCES users(user_id) ON DELETE CASCADE,
+    role_id INT REFERENCES roles(role_id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, role_id)
+);
+
+CREATE TABLE role_perm (
+    role_id INT REFERENCES roles(role_id) ON DELETE CASCADE,
+    perm_id INT REFERENCES permissions(perm_id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, perm_id)
+);
+
+-- User preferences / settings (from settings_schema migration)
+CREATE TABLE user_settings (
+    user_id               INT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+    theme                 TEXT DEFAULT 'system' CHECK (theme IN ('light', 'dark', 'system')),
+    notifications_enabled BOOLEAN DEFAULT TRUE,
+    language              TEXT DEFAULT 'en',
+    updated_at            TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Academic Entities ─────────────────────────────────────────────────────────
+
+-- subject must be defined before instructor (FK dependency)
+CREATE TABLE subject (
+    subject_id   SERIAL PRIMARY KEY,
+    subject_name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE student (
+    student_id SERIAL PRIMARY KEY,
+    user_id    INT UNIQUE NOT NULL REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE instructor (
+    instructor_id SERIAL PRIMARY KEY,
+    user_id       INT UNIQUE NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    bio           TEXT,
+    subject_id    INT REFERENCES subject(subject_id) ON DELETE SET NULL
+);
+
+-- avg_rating column added directly (used by optimizations_v2 sync_course_rating trigger)
+CREATE TABLE course (
+    course_id   SERIAL PRIMARY KEY,
+    title       TEXT NOT NULL,
+    description TEXT,
+    price       NUMERIC DEFAULT 0 CONSTRAINT positive_price CHECK (price >= 0),
+    avg_rating  NUMERIC                                  -- denormalised; kept in sync by trg_review_sync_rating
+);
+
+CREATE TABLE course_sub (
+    course_id  INT REFERENCES course(course_id)  ON DELETE CASCADE,
+    subject_id INT REFERENCES subject(subject_id) ON DELETE CASCADE,
+    PRIMARY KEY (course_id, subject_id)
+);
+
+CREATE TABLE instructs (
+    instructor_id INT REFERENCES instructor(instructor_id) ON DELETE CASCADE,
+    course_id     INT REFERENCES course(course_id)         ON DELETE CASCADE,
+    PRIMARY KEY (instructor_id, course_id)
+);
+
+CREATE TABLE module (
+    module_id   SERIAL PRIMARY KEY,
+    course_id   INT REFERENCES course(course_id) ON DELETE CASCADE,
+    title       TEXT NOT NULL,
+    description TEXT
+);
+
+CREATE TABLE material_type (
+    type_id   SERIAL PRIMARY KEY,
+    type_name TEXT UNIQUE NOT NULL
+);
+
+-- Mux streaming columns baked in (from add_mux_columns migration)
+CREATE TABLE material (
+    material_id     SERIAL PRIMARY KEY,
+    module_id       INT  REFERENCES module(module_id)           ON DELETE CASCADE,
+    type_id         INT  REFERENCES material_type(type_id),
+    name            TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    uploaded_by     INT  REFERENCES instructor(instructor_id)   ON DELETE SET NULL,   -- from align_er_diagram migration
+    mux_playback_id TEXT,
+    mux_asset_id    TEXT,
+    mux_upload_id   TEXT,
+    mux_status      TEXT DEFAULT 'pending'
+);
+
+-- is_published / published_at baked in (from exam_publishing_and_immutability migration)
+CREATE TABLE exam (
+    exam_id      SERIAL PRIMARY KEY,
+    module_id    INT REFERENCES module(module_id) ON DELETE CASCADE,
+    title        TEXT NOT NULL,
+    marks        NUMERIC,
+    duration     INT,
+    is_published BOOLEAN NOT NULL DEFAULT FALSE,
+    published_at TIMESTAMPTZ
+);
+
+-- marks column baked in (from best_score_audit_logging migration)
+CREATE TABLE question (
+    ques_id        SERIAL PRIMARY KEY,
+    exam_id        INT    REFERENCES exam(exam_id) ON DELETE CASCADE,
+    ques_statement TEXT   NOT NULL,
+    options        JSONB  NOT NULL,
+    correct_ans    TEXT   NOT NULL,
+    marks          NUMERIC NOT NULL DEFAULT 1,
+    CONSTRAINT options_is_array CHECK (jsonb_typeof(options) = 'array')
+);
+
+-- ── Financial Tables ──────────────────────────────────────────────────────────
+-- All SSLCommerz columns baked in (from upgrade_financial_tables_for_sslcommerz migration)
+
+CREATE TABLE orders (
+    order_id        SERIAL PRIMARY KEY,
+    user_id         INT     REFERENCES users(user_id)    ON DELETE CASCADE,
+    course_id       INT     REFERENCES course(course_id) ON DELETE SET NULL,   -- from SSLCommerz migration
+    amount          NUMERIC,
+    currency        TEXT DEFAULT 'BDT',
+    status          TEXT DEFAULT 'PENDING',
+    ssl_tran_id     TEXT UNIQUE,
+    ssl_session_key TEXT,
+    placed_at       TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- course_order junction table (from align_er_diagram migration)
+CREATE TABLE course_order (
+    order_id  INT NOT NULL REFERENCES orders(order_id)  ON DELETE CASCADE,
+    course_id INT NOT NULL REFERENCES course(course_id) ON DELETE CASCADE,
+    PRIMARY KEY (order_id, course_id)
+);
+
+-- All SSLCommerz audit columns baked in
+CREATE TABLE payment (
+    payment_id     SERIAL PRIMARY KEY,
+    order_id       INT    REFERENCES orders(order_id) ON DELETE CASCADE,
+    amount         NUMERIC NOT NULL,
+    status         TEXT    NOT NULL,
+    method         TEXT,
+    time           TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    transaction_id TEXT UNIQUE,
+    ssl_val_id     TEXT,
+    bank_tran_id   TEXT,
+    gateway_response JSONB
+);
+
+-- ── Enrollment & Attempt ──────────────────────────────────────────────────────
+-- order_id, progress columns baked in (from align_er_diagram migration)
+
+CREATE TABLE enrollment (
+    enrollment_id SERIAL PRIMARY KEY,
+    student_id    INT     REFERENCES student(student_id) ON DELETE CASCADE,
+    course_id     INT     REFERENCES course(course_id)   ON DELETE CASCADE,
+    order_id      INT     REFERENCES orders(order_id)    ON DELETE SET NULL,
+    enrolled_at   TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    progress      NUMERIC DEFAULT 0 CONSTRAINT progress_range CHECK (progress >= 0 AND progress <= 100)
+);
+
+-- started_at / submitted_at / duration_minutes columns baked in
+-- (from best_score_audit_logging and add_duration_to_attempt migrations)
+CREATE TABLE attempt (
+    attempt_id     SERIAL PRIMARY KEY,
+    student_id     INT REFERENCES student(student_id) ON DELETE CASCADE,
+    exam_id        INT REFERENCES exam(exam_id)       ON DELETE CASCADE,
+    started_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    submitted_at   TIMESTAMPTZ,
+    mode           TEXT,
+    score          NUMERIC,
+    duration_minutes INT                                  -- how long the student took
+);
+
+CREATE TABLE response (
+    response_id   SERIAL PRIMARY KEY,
+    attempt_id    INT  REFERENCES attempt(attempt_id)  ON DELETE CASCADE,
+    ques_id       INT  REFERENCES question(ques_id)    ON DELETE CASCADE,
+    response_text TEXT,
+    CONSTRAINT response_attempt_question_unique UNIQUE (attempt_id, ques_id)
+);
+
+-- ── Social / Content ──────────────────────────────────────────────────────────
+
+CREATE TABLE review (
+    review_id   SERIAL PRIMARY KEY,
+    user_id     INT     REFERENCES users(user_id)    ON DELETE CASCADE,
+    course_id   INT     REFERENCES course(course_id) ON DELETE CASCADE,
+    rating      NUMERIC CONSTRAINT rating_range CHECK (rating >= 1 AND rating <= 5),
+    review_text TEXT
+);
+
+CREATE TABLE comment (
+    comment_id   SERIAL PRIMARY KEY,
+    user_id      INT  REFERENCES users(user_id)   ON DELETE CASCADE,
+    module_id    INT  REFERENCES module(module_id) ON DELETE CASCADE,
+    comment_text TEXT NOT NULL,
+    time         TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- replier_user_id baked in (from add_performance_indexes migration)
+CREATE TABLE reply (
+    reply_id        SERIAL PRIMARY KEY,
+    comment_id      INT REFERENCES comment(comment_id) ON DELETE CASCADE,
+    replier_user_id INT REFERENCES users(user_id)      ON DELETE SET NULL,
+    reply_text      TEXT NOT NULL
+);
+
+-- ── Notifications ─────────────────────────────────────────────────────────────
+-- (from add_notifications migration — already in original schema, kept idempotent)
+
+CREATE TABLE notification (
+    notification_id SERIAL PRIMARY KEY,
+    user_id         INT  REFERENCES users(user_id) ON DELETE CASCADE,
+    message         TEXT    NOT NULL,
+    link            TEXT,
+    is_read         BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Audit Log ─────────────────────────────────────────────────────────────────
+-- (from best_score_audit_logging migration)
+
+CREATE TABLE dml_audit_log (
+    log_id      BIGSERIAL PRIMARY KEY,
+    table_name  TEXT,
+    operation   TEXT,
+    row_id      INT,
+    details     JSONB,
+    happened_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Chat & Contact ────────────────────────────────────────────────────────────
+
+CREATE TABLE chat_messages (
+    message_id SERIAL PRIMARY KEY,
+    user_id    INT  NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    role       TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content    TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE contact_messages (
+    id         SERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    email      TEXT NOT NULL,
+    message    TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ==============================================================================
+-- INDEXES
+-- ==============================================================================
+
+-- ── Sessions ──────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id           ON sessions(user_id);
+
+-- ── Notification ──────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_notification_user_unread   ON notification(user_id, is_read);
+-- Partial index for active (unread) notifications
+CREATE INDEX IF NOT EXISTS idx_unread_notifications        ON notification(user_id) WHERE is_read = FALSE;
+
+-- ── Student / Enrollment ──────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_student_user_id             ON student(user_id);
+CREATE INDEX IF NOT EXISTS idx_enrollment_student_id       ON enrollment(student_id);
+CREATE INDEX IF NOT EXISTS idx_enrollment_course_id        ON enrollment(course_id);
+-- Unique composite — also enforces one enrollment per (student, course)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_enrollment_student_course ON enrollment(student_id, course_id);
+
+-- ── Attempt ───────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_attempt_student_id          ON attempt(student_id);
+CREATE INDEX IF NOT EXISTS idx_attempt_exam_id             ON attempt(exam_id);
+CREATE INDEX IF NOT EXISTS idx_attempt_student_exam        ON attempt(student_id, exam_id);
+CREATE INDEX IF NOT EXISTS idx_attempt_score               ON attempt(student_id, score DESC);
+
+-- ── Exam / Module / Course ────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_exam_module_id              ON exam(module_id);
+CREATE INDEX IF NOT EXISTS idx_module_course_id            ON module(course_id);
+
+-- Full-text GIN indexes for course and module search
+CREATE INDEX IF NOT EXISTS idx_course_search ON course USING GIN (
+    to_tsvector('english', title || ' ' || COALESCE(description, ''))
+);
+CREATE INDEX IF NOT EXISTS idx_module_search ON module USING GIN (
+    to_tsvector('english', title || ' ' || COALESCE(description, ''))
+);
+
+-- Trigram indexes for ILIKE search (requires pg_trgm)
+CREATE INDEX IF NOT EXISTS idx_course_title_trgm ON course USING GIN (title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_users_name_trgm   ON users  USING GIN (name  gin_trgm_ops);
+
+-- ── Payment / Orders ──────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_payment_order_status        ON payment(order_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_transaction_id ON payment(transaction_id);
+CREATE INDEX IF NOT EXISTS idx_orders_user_id              ON orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_user_placed          ON orders(user_id, placed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_user_status          ON orders(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_orders_course_status        ON orders(course_id, status);
+CREATE INDEX IF NOT EXISTS idx_orders_ssl_tran_id          ON orders(ssl_tran_id);
+
+-- ── Junction Tables ───────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_course_order_course_id      ON course_order(course_id);
+CREATE INDEX IF NOT EXISTS idx_instructs_course_id         ON instructs(course_id);
+CREATE INDEX IF NOT EXISTS idx_course_sub_subject_id       ON course_sub(subject_id);
+
+-- ── Review / Comment / Reply ──────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_review_course_id            ON review(course_id);
+CREATE INDEX IF NOT EXISTS idx_review_user_course          ON review(user_id, course_id);
+CREATE INDEX IF NOT EXISTS idx_comment_module_id           ON comment(module_id);
+CREATE INDEX IF NOT EXISTS idx_comment_user_id             ON comment(user_id);
+CREATE INDEX IF NOT EXISTS idx_reply_comment_id            ON reply(comment_id);
+
+-- ── Chat ──────────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_chat_messages_user          ON chat_messages(user_id, created_at ASC);
+
+
+-- ==============================================================================
+-- FUNCTIONS
+-- ==============================================================================
+
+-- ── Core Helper Functions ─────────────────────────────────────────────────────
+
+-- Returns average rating for a course (legacy helper used in some places)
+CREATE OR REPLACE FUNCTION get_course_average_rating(c_id INT)
+RETURNS NUMERIC
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+    RETURN (SELECT ROUND(AVG(rating), 1) FROM review WHERE course_id = c_id);
+END;
+$$;
+
+-- Returns average score for a student across all exams
+CREATE OR REPLACE FUNCTION get_student_average_score(s_id INT)
+RETURNS NUMERIC
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+    RETURN (SELECT ROUND(AVG(score), 1) FROM attempt WHERE student_id = s_id);
+END;
+$$;
+
+-- Returns total enrollment count for a course (legacy helper)
+CREATE OR REPLACE FUNCTION get_course_enrollment_count(c_id INT)
+RETURNS INT
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+    RETURN (SELECT COUNT(*) FROM enrollment WHERE course_id = c_id);
+END;
+$$;
+
+-- ── optimizations_v2: Accurate Course Progress ──────────────────────────────
+
+CREATE OR REPLACE FUNCTION calculate_course_progress(p_student_id INT, p_course_id INT)
+RETURNS NUMERIC
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_total_modules     INT;
+    v_completed_modules INT;
+BEGIN
+    SELECT COUNT(*) INTO v_total_modules FROM module WHERE course_id = p_course_id;
+    IF v_total_modules = 0 THEN RETURN 100; END IF;
+
+    SELECT COUNT(DISTINCT m.module_id) INTO v_completed_modules
+    FROM attempt a
+    JOIN exam e   ON a.exam_id   = e.exam_id
+    JOIN module m ON e.module_id = m.module_id
+    WHERE a.student_id = p_student_id
+      AND m.course_id  = p_course_id
+      AND a.score     >= 50;    -- completion threshold
+
+    RETURN ROUND((v_completed_modules::NUMERIC / v_total_modules::NUMERIC) * 100, 2);
+END;
+$$;
+
+-- ── optimizations_v2: Comprehensive Exam Summary Stats ──────────────────────
+
+CREATE OR REPLACE FUNCTION get_exam_summary_stats(p_exam_id INT)
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_result JSONB;
+BEGIN
+    SELECT jsonb_build_object(
+        'exam_id',        p_exam_id,
+        'total_attempts', COUNT(*),
+        'avg_score',      ROUND(AVG(score), 2),
+        'max_score',      MAX(score),
+        'min_score',      MIN(score),
+        'pass_rate',      ROUND(
+                            (COUNT(*) FILTER (WHERE score >= 50)::NUMERIC /
+                             NULLIF(COUNT(*), 0)::NUMERIC) * 100, 2),
+        'last_attempt_at', MAX(submitted_at)
+    )
+    INTO v_result
+    FROM attempt
+    WHERE exam_id = p_exam_id;
+
+    RETURN COALESCE(v_result, '{}'::JSONB);
+END;
+$$;
+
+-- ── analytics_functions: Exam-level Functions ─────────────────────────────────
+
+-- 1. Average score for an exam
+CREATE OR REPLACE FUNCTION fn_exam_average_score(p_exam_id INT)
+RETURNS NUMERIC STABLE LANGUAGE sql AS $$
+    SELECT COALESCE(ROUND(AVG(score), 2), 0) FROM attempt WHERE exam_id = p_exam_id;
+$$;
+
+-- 2. Total enrolled students in the course an exam belongs to
+CREATE OR REPLACE FUNCTION fn_exam_enrolled_student_count(p_exam_id INT)
+RETURNS INT STABLE LANGUAGE sql AS $$
+    SELECT COUNT(*)::INT
+    FROM enrollment e
+    JOIN module m ON e.course_id = m.course_id
+    JOIN exam   ex ON m.module_id = ex.module_id
+    WHERE ex.exam_id = p_exam_id;
+$$;
+
+-- 3. Unique students who attempted this exam
+CREATE OR REPLACE FUNCTION fn_exam_students_attempted_count(p_exam_id INT)
+RETURNS INT STABLE LANGUAGE sql AS $$
+    SELECT COUNT(DISTINCT student_id)::INT FROM attempt WHERE exam_id = p_exam_id;
+$$;
+
+-- 4. Average of each student's best score on an exam
+CREATE OR REPLACE FUNCTION fn_exam_average_best_score_percent(p_exam_id INT)
+RETURNS NUMERIC STABLE LANGUAGE sql AS $$
+    WITH best_scores AS (
+        SELECT MAX(score) AS max_score
+        FROM attempt
+        WHERE exam_id = p_exam_id
+        GROUP BY student_id
+    )
+    SELECT COALESCE(ROUND(AVG(max_score), 2), 0) FROM best_scores;
+$$;
+
+-- 5. Best score achieved by a specific student on an exam
+CREATE OR REPLACE FUNCTION fn_student_exam_best_percent(p_student_id INT, p_exam_id INT)
+RETURNS NUMERIC STABLE LANGUAGE sql AS $$
+    SELECT COALESCE(MAX(score), 0)
+    FROM attempt
+    WHERE student_id = p_student_id AND exam_id = p_exam_id;
+$$;
+
+-- 6. Attempt rate (attempted / enrolled) as a percentage
+CREATE OR REPLACE FUNCTION fn_exam_attempt_rate_percent(p_exam_id INT)
+RETURNS NUMERIC STABLE LANGUAGE plpgsql AS $$
+DECLARE
+    v_enrolled  INT;
+    v_attempted INT;
+BEGIN
+    v_enrolled  := fn_exam_enrolled_student_count(p_exam_id);
+    v_attempted := fn_exam_students_attempted_count(p_exam_id);
+    IF v_enrolled = 0 THEN RETURN 0; END IF;
+    RETURN ROUND((v_attempted::NUMERIC / v_enrolled::NUMERIC) * 100, 2);
+END;
+$$;
+
+-- 7. Average duration (in minutes) for an exam
+CREATE OR REPLACE FUNCTION fn_exam_average_duration_minutes(p_exam_id INT)
+RETURNS NUMERIC STABLE LANGUAGE sql AS $$
+    SELECT COALESCE(ROUND(AVG(duration_minutes), 2), 0) FROM attempt WHERE exam_id = p_exam_id;
+$$;
+
+-- ── analytics_functions: Course-level Functions ───────────────────────────────
+
+-- 8. Unique students who attempted any exam in a course
+CREATE OR REPLACE FUNCTION fn_course_students_attempted_exams_count(p_course_id INT)
+RETURNS INT STABLE LANGUAGE sql AS $$
+    SELECT COUNT(DISTINCT a.student_id)::INT
+    FROM attempt a
+    JOIN exam   e ON a.exam_id   = e.exam_id
+    JOIN module m ON e.module_id = m.module_id
+    WHERE m.course_id = p_course_id;
+$$;
+
+-- 9. Total attempts across all exams in a course
+CREATE OR REPLACE FUNCTION fn_course_exam_attempts_count(p_course_id INT)
+RETURNS INT STABLE LANGUAGE sql AS $$
+    SELECT COUNT(*)::INT
+    FROM attempt a
+    JOIN exam   e ON a.exam_id   = e.exam_id
+    JOIN module m ON e.module_id = m.module_id
+    WHERE m.course_id = p_course_id;
+$$;
+
+-- 10. Total enrollment count for a course
+CREATE OR REPLACE FUNCTION fn_course_enrollment_count(p_course_id INT)
+RETURNS INT STABLE LANGUAGE sql AS $$
+    SELECT COUNT(*)::INT FROM enrollment WHERE course_id = p_course_id;
+$$;
+
+-- 11. Average student rating for a course
+CREATE OR REPLACE FUNCTION fn_course_average_rating(p_course_id INT)
+RETURNS NUMERIC STABLE LANGUAGE sql AS $$
+    SELECT COALESCE(ROUND(AVG(rating), 2), 0) FROM review WHERE course_id = p_course_id;
+$$;
+
+
+-- ==============================================================================
+-- PROCEDURES
+-- ==============================================================================
+
+-- Exam grading: set-based scoring, idempotency guard
+CREATE OR REPLACE PROCEDURE proc_submit_attempt(p_attempt_id INT)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_submitted_at TIMESTAMPTZ;
+    v_score        NUMERIC;
+BEGIN
+    -- Pre-condition: reject double-submissions
+    SELECT submitted_at INTO v_submitted_at FROM attempt WHERE attempt_id = p_attempt_id;
+    IF v_submitted_at IS NOT NULL THEN
+        RAISE EXCEPTION 'Attempt already submitted.';
+    END IF;
+
+    -- Bulk/set-based grading
+    SELECT SUM(CASE WHEN r.response_text = q.correct_ans THEN q.marks ELSE 0 END)
+    INTO v_score
+    FROM response r
+    JOIN question q ON r.ques_id = q.ques_id
+    WHERE r.attempt_id = p_attempt_id;
+
+    -- Record result
+    UPDATE attempt
+    SET score        = COALESCE(v_score, 0),
+        submitted_at = CURRENT_TIMESTAMP
+    WHERE attempt_id = p_attempt_id;
+END;
+$$;
+
+-- Full course purchase transaction (order → payment → enrollment)
+CREATE OR REPLACE PROCEDURE process_course_purchase(
+    p_user_id        INT,
+    p_course_id      INT,
+    p_amount         NUMERIC,
+    p_payment_method TEXT,
+    p_transaction_id TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_order_id   INT;
+    v_student_id INT;
+BEGIN
+    INSERT INTO orders (user_id) VALUES (p_user_id) RETURNING order_id INTO v_order_id;
+    INSERT INTO course_order (order_id, course_id) VALUES (v_order_id, p_course_id) ON CONFLICT DO NOTHING;
+    INSERT INTO payment (order_id, amount, status, method, transaction_id)
+    VALUES (v_order_id, p_amount, 'COMPLETED', p_payment_method, p_transaction_id);
+    SELECT student_id INTO v_student_id FROM student WHERE user_id = p_user_id;
+    INSERT INTO enrollment (student_id, course_id, order_id)
+    VALUES (v_student_id, p_course_id, v_order_id) ON CONFLICT DO NOTHING;
+    COMMIT;
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE EXCEPTION 'Purchase failed: %', SQLERRM;
+END;
+$$;
+
+
+-- ==============================================================================
+-- TRIGGER FUNCTIONS
+-- ==============================================================================
+
+-- ── Auth / Settings ───────────────────────────────────────────────────────────
+
+-- Auto-create user_settings row on every new user (from settings_schema migration)
+CREATE OR REPLACE FUNCTION create_user_settings_function()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO user_settings (user_id) VALUES (NEW.user_id)
+    ON CONFLICT (user_id) DO NOTHING;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Review Gate ───────────────────────────────────────────────────────────────
+
+-- Rejects reviews from students not enrolled in the course
+CREATE OR REPLACE FUNCTION verify_enrollment_function()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+DECLARE
+    is_enrolled BOOLEAN;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1
+        FROM enrollment e
+        JOIN student s ON e.student_id = s.student_id
+        WHERE s.user_id = NEW.user_id AND e.course_id = NEW.course_id
+    ) INTO is_enrolled;
+
+    IF NOT is_enrolled THEN
+        RAISE EXCEPTION 'User is not enrolled in this course and cannot leave a review.';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+-- ── Notification Cleanup ──────────────────────────────────────────────────────
+
+-- Auto-deletes notifications older than 30 days on each new insert
+CREATE OR REPLACE FUNCTION delete_old_notifications_function()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+    DELETE FROM notification WHERE created_at < NOW() - INTERVAL '30 days';
+    RETURN NEW;
+END;
+$$;
+
+-- ── Exam Lifecycle ────────────────────────────────────────────────────────────
+
+-- Sets published_at when an exam is first published
+CREATE OR REPLACE FUNCTION set_exam_publish_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.is_published = TRUE AND (OLD.is_published IS NULL OR OLD.is_published = FALSE) THEN
+        NEW.published_at = NOW();
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Prevents edits or deletes on published exams
+CREATE OR REPLACE FUNCTION lock_exam_after_publish()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'DELETE') THEN
+        IF OLD.is_published THEN
+            RAISE EXCEPTION 'Published exams cannot be edited or deleted.' USING ERRCODE = 'P0001';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF (TG_OP = 'UPDATE') THEN
+        IF OLD.is_published THEN
+            RAISE EXCEPTION 'Published exams cannot be edited or deleted.' USING ERRCODE = 'P0001';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Prevents question mutations when the parent exam is published
+CREATE OR REPLACE FUNCTION lock_question_if_exam_published()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_is_published BOOLEAN;
+BEGIN
+    IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
+        SELECT is_published INTO v_is_published FROM exam WHERE exam_id = NEW.exam_id;
+        IF v_is_published THEN
+            RAISE EXCEPTION 'Published exams cannot be edited or deleted.' USING ERRCODE = 'P0001';
+        END IF;
+        RETURN NEW;
+    ELSIF (TG_OP = 'DELETE') THEN
+        SELECT is_published INTO v_is_published FROM exam WHERE exam_id = OLD.exam_id;
+        IF v_is_published THEN
+            RAISE EXCEPTION 'Published exams cannot be edited or deleted.' USING ERRCODE = 'P0001';
+        END IF;
+        RETURN OLD;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Enrollment Enforcement ────────────────────────────────────────────────────
+
+-- Students must be enrolled in the course before they can start an exam attempt
+CREATE OR REPLACE FUNCTION verify_enrollment_before_attempt()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_course_id  INT;
+    v_is_enrolled BOOLEAN;
+BEGIN
+    SELECT module.course_id INTO v_course_id
+    FROM exam
+    JOIN module ON exam.module_id = module.module_id
+    WHERE exam.exam_id = NEW.exam_id;
+
+    SELECT EXISTS (
+        SELECT 1 FROM enrollment
+        WHERE student_id = NEW.student_id AND course_id = v_course_id
+    ) INTO v_is_enrolled;
+
+    IF NOT v_is_enrolled THEN
+        RAISE EXCEPTION 'You must be enrolled in the course to attempt this exam.' USING ERRCODE = 'P0005';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Response Integrity ────────────────────────────────────────────────────────
+
+-- Validates that a response belongs to the exam and is a valid option
+CREATE OR REPLACE FUNCTION validate_response_belongs_to_attempt()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_exam_id      INT;
+    v_ques_exam_id INT;
+    v_is_valid_option BOOLEAN;
+BEGIN
+    SELECT exam_id INTO v_exam_id     FROM attempt  WHERE attempt_id = NEW.attempt_id;
+    SELECT exam_id INTO v_ques_exam_id FROM question WHERE ques_id   = NEW.ques_id;
+
+    IF v_exam_id IS NULL OR v_ques_exam_id IS NULL OR v_exam_id <> v_ques_exam_id THEN
+        RAISE EXCEPTION 'Question does not belong to the exam associated with this attempt.' USING ERRCODE = 'P0002';
+    END IF;
+
+    SELECT EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(
+            (SELECT options FROM question WHERE ques_id = NEW.ques_id)
+        ) AS opt
+        WHERE opt = NEW.response_text
+    ) INTO v_is_valid_option;
+
+    IF NOT v_is_valid_option THEN
+        RAISE EXCEPTION 'Invalid response option selected.' USING ERRCODE = 'P0003';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Audit Logging ─────────────────────────────────────────────────────────────
+
+-- Logs INSERT and score-changing UPDATE events on the attempt table
+CREATE OR REPLACE FUNCTION log_attempt_changes()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') THEN
+        INSERT INTO dml_audit_log (table_name, operation, row_id, details)
+        VALUES ('attempt', 'INSERT', NEW.attempt_id, jsonb_build_object(
+            'student_id', NEW.student_id,
+            'exam_id',    NEW.exam_id,
+            'started_at', NEW.started_at
+        ));
+    ELSIF (TG_OP = 'UPDATE') THEN
+        IF (NEW.score IS DISTINCT FROM OLD.score OR NEW.submitted_at IS DISTINCT FROM OLD.submitted_at) THEN
+            INSERT INTO dml_audit_log (table_name, operation, row_id, details)
+            VALUES ('attempt', 'UPDATE', NEW.attempt_id, jsonb_build_object(
+                'score',        NEW.score,
+                'submitted_at', NEW.submitted_at
+            ));
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Progress Tracking ─────────────────────────────────────────────────────────
+
+-- Recalculates enrollment.progress after each exam attempt (score >= 50 = module complete)
+CREATE OR REPLACE FUNCTION update_student_progress()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    v_total_modules     INT;
+    v_completed_modules INT;
+    t_course_id         INT;
+BEGIN
+    SELECT m.course_id INTO t_course_id
+    FROM exam e
+    JOIN module m ON e.module_id = m.module_id
+    WHERE e.exam_id = NEW.exam_id
+    LIMIT 1;
+
+    SELECT COUNT(*) INTO v_total_modules FROM module WHERE course_id = t_course_id;
+
+    SELECT COUNT(DISTINCT m.module_id) INTO v_completed_modules
+    FROM attempt a
+    JOIN exam   e ON a.exam_id   = e.exam_id
+    JOIN module m ON e.module_id = m.module_id
+    WHERE a.student_id = NEW.student_id
+      AND m.course_id  = t_course_id
+      AND a.score     >= 50;
+
+    UPDATE enrollment
+    SET progress = CASE
+        WHEN v_total_modules > 0 THEN (v_completed_modules::NUMERIC / v_total_modules::NUMERIC) * 100
+        ELSE 100
+    END
+    WHERE student_id = NEW.student_id AND course_id = t_course_id;
+
+    RETURN NEW;
+END;
+$$;
+
+-- ── Orders Timestamps ─────────────────────────────────────────────────────────
+
+-- Keeps orders.updated_at current on every UPDATE
+CREATE OR REPLACE FUNCTION update_orders_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Denormalised Rating Sync (optimizations_v2) ───────────────────────────────
+
+-- Keeps course.avg_rating in sync when reviews are inserted, updated, or deleted
+CREATE OR REPLACE FUNCTION sync_course_rating()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE course
+    SET avg_rating = (
+        SELECT ROUND(AVG(rating), 1)
+        FROM review
+        WHERE course_id = COALESCE(NEW.course_id, OLD.course_id)
+    )
+    WHERE course_id = COALESCE(NEW.course_id, OLD.course_id);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── Instructor Enrollment Notification (optimizations_v2) ─────────────────────
+
+-- Notifies the instructor when a student enrols in their course
+CREATE OR REPLACE FUNCTION notify_instructor_on_enrollment()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_instructor_user_id INT;
+    v_course_title       TEXT;
+BEGIN
+    SELECT i.user_id, c.title
+    INTO v_instructor_user_id, v_course_title
+    FROM instructs ins
+    JOIN instructor i ON ins.instructor_id = i.instructor_id
+    JOIN course     c ON ins.course_id     = c.course_id
+    WHERE ins.course_id = NEW.course_id
+    LIMIT 1;
+
+    IF v_instructor_user_id IS NOT NULL THEN
+        INSERT INTO notification (user_id, message, link)
+        VALUES (
+            v_instructor_user_id,
+            'New student enrolled in ' || v_course_title,
+            '/instructor/courses/' || NEW.course_id
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ==============================================================================
+-- TRIGGERS
+-- (DROP IF EXISTS before each CREATE so the file is safe to re-run)
+-- ==============================================================================
+
+-- ── users ─────────────────────────────────────────────────────────────────────
+DROP TRIGGER IF EXISTS trg_auto_create_user_settings ON users;
+CREATE TRIGGER trg_auto_create_user_settings
+AFTER INSERT ON users
+FOR EACH ROW
+EXECUTE FUNCTION create_user_settings_function();
+
+-- ── review ────────────────────────────────────────────────────────────────────
+DROP TRIGGER IF EXISTS check_enrollment_before_review ON review;
+CREATE TRIGGER check_enrollment_before_review
+BEFORE INSERT ON review
+FOR EACH ROW
+EXECUTE FUNCTION verify_enrollment_function();
+
+DROP TRIGGER IF EXISTS trg_review_sync_rating ON review;
+CREATE TRIGGER trg_review_sync_rating
+AFTER INSERT OR UPDATE OR DELETE ON review
+FOR EACH ROW
+EXECUTE FUNCTION sync_course_rating();
+
+-- ── notification ──────────────────────────────────────────────────────────────
+DROP TRIGGER IF EXISTS cleanup_old_notifications ON notification;
+CREATE TRIGGER cleanup_old_notifications
+AFTER INSERT ON notification
+FOR EACH STATEMENT
+EXECUTE FUNCTION delete_old_notifications_function();
+
+-- ── exam ──────────────────────────────────────────────────────────────────────
+DROP TRIGGER IF EXISTS trg_set_exam_publish_timestamp ON exam;
+CREATE TRIGGER trg_set_exam_publish_timestamp
+BEFORE UPDATE ON exam
+FOR EACH ROW
+EXECUTE FUNCTION set_exam_publish_timestamp();
+
+DROP TRIGGER IF EXISTS trg_lock_exam_after_publish ON exam;
+CREATE TRIGGER trg_lock_exam_after_publish
+BEFORE UPDATE OR DELETE ON exam
+FOR EACH ROW
+EXECUTE FUNCTION lock_exam_after_publish();
+
+-- ── question ──────────────────────────────────────────────────────────────────
+DROP TRIGGER IF EXISTS trg_lock_question_if_exam_published ON question;
+CREATE TRIGGER trg_lock_question_if_exam_published
+BEFORE INSERT OR UPDATE OR DELETE ON question
+FOR EACH ROW
+EXECUTE FUNCTION lock_question_if_exam_published();
+
+-- ── attempt ───────────────────────────────────────────────────────────────────
+DROP TRIGGER IF EXISTS trg_verify_enrollment_before_attempt ON attempt;
+CREATE TRIGGER trg_verify_enrollment_before_attempt
+BEFORE INSERT ON attempt
+FOR EACH ROW
+EXECUTE FUNCTION verify_enrollment_before_attempt();
+
+DROP TRIGGER IF EXISTS trg_log_attempt_changes ON attempt;
+CREATE TRIGGER trg_log_attempt_changes
+AFTER INSERT OR UPDATE ON attempt
+FOR EACH ROW
+EXECUTE FUNCTION log_attempt_changes();
+
+DROP TRIGGER IF EXISTS trg_after_exam_attempt ON attempt;
+CREATE TRIGGER trg_after_exam_attempt
+AFTER INSERT OR UPDATE ON attempt
+FOR EACH ROW
+EXECUTE FUNCTION update_student_progress();
+
+-- ── response ──────────────────────────────────────────────────────────────────
+DROP TRIGGER IF EXISTS trg_validate_response_belongs_to_attempt ON response;
+CREATE TRIGGER trg_validate_response_belongs_to_attempt
+BEFORE INSERT OR UPDATE ON response
+FOR EACH ROW
+EXECUTE FUNCTION validate_response_belongs_to_attempt();
+
+-- ── enrollment ────────────────────────────────────────────────────────────────
+DROP TRIGGER IF EXISTS trg_enrollment_notification ON enrollment;
+CREATE TRIGGER trg_enrollment_notification
+AFTER INSERT ON enrollment
+FOR EACH ROW
+EXECUTE FUNCTION notify_instructor_on_enrollment();
+
+-- ── orders ────────────────────────────────────────────────────────────────────
+DROP TRIGGER IF EXISTS trg_update_orders_updated_at ON orders;
+CREATE TRIGGER trg_update_orders_updated_at
+BEFORE UPDATE ON orders
+FOR EACH ROW
+EXECUTE FUNCTION update_orders_updated_at();
+
+
+-- ==============================================================================
+-- MATERIALIZED VIEWS (optimizations_v2)
+-- ==============================================================================
+
+-- Pre-aggregated instructor statistics; refresh with:
+--   REFRESH MATERIALIZED VIEW CONCURRENTLY mv_instructor_stats;
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_instructor_stats AS
+SELECT
+    i.instructor_id,
+    u.name                              AS instructor_name,
+    COUNT(DISTINCT c.course_id)         AS total_courses,
+    COUNT(DISTINCT e.enrollment_id)     AS total_students,
+    ROUND(AVG(r.rating), 2)            AS avg_rating,
+    SUM(p.amount)                       AS total_revenue
+FROM instructor i
+JOIN users u       ON i.user_id       = u.user_id
+LEFT JOIN instructs ins ON i.instructor_id = ins.instructor_id
+LEFT JOIN course    c   ON ins.course_id   = c.course_id
+LEFT JOIN enrollment e  ON c.course_id    = e.course_id
+LEFT JOIN review    r   ON c.course_id    = r.course_id
+LEFT JOIN payment   p   ON e.order_id     = p.order_id AND p.status = 'COMPLETED'
+GROUP BY i.instructor_id, u.name;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_instructor_stats_id ON mv_instructor_stats(instructor_id);
+
+
+-- ==============================================================================
+-- ANALYTICS VIEWS (analytics_functions)
+-- ==============================================================================
+
+-- Courses ranked by enrollment count
+CREATE OR REPLACE VIEW vw_course_popularity_by_enrollment AS
+SELECT
+    course_id,
+    title,
+    fn_course_enrollment_count(course_id) AS enrollment_count
+FROM course
+ORDER BY enrollment_count DESC;
+
+-- Courses ranked by average student rating
+CREATE OR REPLACE VIEW vw_course_popularity_by_rating AS
+SELECT
+    course_id,
+    title,
+    fn_course_average_rating(course_id) AS average_rating
+FROM course
+ORDER BY average_rating DESC;
+
+
+-- ==============================================================================
+-- SEED DATA FOR EXISTING ROWS
+-- ==============================================================================
+
+-- Backfill user_settings for any users inserted before this schema was applied
+INSERT INTO user_settings (user_id)
+SELECT user_id FROM users
+ON CONFLICT (user_id) DO NOTHING;
+
+
+-- ==============================================================================
+-- SCALABILITY NOTES
+-- ==============================================================================
+/*
+1. Race condition in process_course_purchase:
+   If two requests arrive simultaneously for the same user/course, both may
+   create an order before the first commits. Mitigation: add a UNIQUE constraint
+   on enrollment(student_id, course_id) — already enforced by
+   idx_enrollment_student_course — and use ON CONFLICT DO NOTHING.
+
+2. update_student_progress trigger cost:
+   This trigger fires on EVERY attempt INSERT/UPDATE. The COUNT(DISTINCT module_id)
+   sub-query becomes expensive at scale. Consider updating progress only when the
+   new score is strictly better than the previous best, or offload to a background job.
+
+3. Payment consistency:
+   The orders.status → 'COMPLETED' transition must be wrapped in the same
+   transaction that creates the enrollment record. The SSLCommerz webhook handler
+   should use an explicit BEGIN/COMMIT block via a dedicated pool client.
+*/
