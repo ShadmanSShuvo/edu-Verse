@@ -12,6 +12,189 @@
 
 ---
 
+## ER Diagram
+
+```mermaid
+erDiagram
+
+%% ========================
+%% USER & ROLE SYSTEM
+%% ========================
+USER {
+  int user_id PK
+  string name
+  string email
+  string phone_no
+  datetime created_at
+}
+
+ROLE {
+  int role_id PK
+  string name
+}
+
+PERMISSION {
+  int perm_id PK
+  string name
+}
+
+USER ||--o{ USER_ROLE : has
+ROLE ||--o{ USER_ROLE : assigned
+ROLE ||--o{ ROLE_PERM : grants
+PERMISSION ||--o{ ROLE_PERM : included
+
+%% ========================
+%% STUDENT & INSTRUCTOR
+%% ========================
+STUDENT {
+  int student_id PK
+}
+
+INSTRUCTOR {
+  int instructor_id PK
+  string bio
+}
+
+USER ||--|| STUDENT : "User_Std"
+USER ||--o| INSTRUCTOR : "User_Inst"
+
+%% ========================
+%% COURSE STRUCTURE
+%% ========================
+COURSE {
+  int course_id PK
+  string title
+  string description
+  float price
+}
+
+SUBJECT {
+  int subject_id PK
+  string subject_name
+}
+
+MODULE {
+  int module_id PK
+  string title
+  string description
+}
+
+MATERIAL {
+  int material_id PK
+  string name
+  string url
+}
+
+MATERIAL_TYPE {
+  int type_id PK
+  string type_name
+}
+
+COURSE ||--o{ MODULE : has
+COURSE ||--o{ SUBJECT : categorized
+MODULE ||--o{ MATERIAL : contains
+MATERIAL ||--o{ MATERIAL_TYPE : typed
+
+INSTRUCTOR ||--o{ COURSE : instructs
+
+%% ========================
+%% ENROLLMENT & PAYMENT
+%% ========================
+ENROLLMENT {
+  int enrollment_id PK
+  date date
+  float progress
+}
+
+ORDER {
+  int order_id PK
+  datetime placed_at
+}
+
+PAYMENT {
+  int payment_id PK
+  float amount
+  string status
+  string method
+  datetime time
+  string transaction_id
+}
+
+STUDENT ||--o{ ENROLLMENT : enrolls
+COURSE ||--o{ ENROLLMENT : contains
+
+STUDENT ||--o{ ORDER : places
+ORDER ||--|| PAYMENT : generates
+ORDER ||--o{ COURSE : course_order
+
+%% ========================
+%% EXAM SYSTEM
+%% ========================
+EXAM {
+  int exam_id PK
+  string title
+  int marks
+  int duration
+}
+
+QUESTION {
+  int ques_id PK
+  string ques_statement
+  string options
+  string correct_ans
+}
+
+ATTEMPT {
+  int attempt_id PK
+  datetime time
+  float score
+}
+
+RESPONSE {
+  int response_id PK
+  string response_text
+}
+
+MODULE ||--o{ EXAM : has
+EXAM ||--o{ QUESTION : contains
+STUDENT ||--o{ ATTEMPT : makes
+EXAM ||--o{ ATTEMPT : attempted
+
+ATTEMPT ||--o{ RESPONSE : has
+QUESTION ||--o{ RESPONSE : answered
+
+%% ========================
+%% REVIEW SYSTEM
+%% ========================
+REVIEW {
+  int review_id PK
+  int rating
+  string review_text
+}
+
+STUDENT ||--o{ REVIEW : writes
+COURSE ||--o{ REVIEW : receives
+
+%% ========================
+%% COMMENT SYSTEM
+%% ========================
+COMMENT {
+  int comment_id PK
+  string comment_text
+  datetime time
+}
+
+REPLY {
+  int reply_id PK
+}
+
+USER ||--o{ COMMENT : writes
+MODULE ||--o{ COMMENT : has
+COMMENT ||--o{ REPLY : has
+```
+
+---
+
 ## ✨ Key Highlights
 
 - **🤖 AI-Powered Intelligence**: 
